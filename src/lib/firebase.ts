@@ -11,9 +11,11 @@ import {
   type User as FirebaseUser
 } from 'firebase/auth';
 import {
+  initializeFirestore,
   getFirestore,
   doc,
   getDoc,
+  getDocFromServer,
   setDoc,
   deleteDoc,
   collection,
@@ -25,6 +27,8 @@ import {
   serverTimestamp,
   onSnapshot,
   limit,
+  enableNetwork,
+  connectFirestoreEmulator,
   type QueryConstraint,
   type Unsubscribe,
 } from 'firebase/firestore';
@@ -36,7 +40,6 @@ import type {
   ExploreCreatorItem,
   ExploreFeedResponse,
 } from '../types/explore';
-import rawFirebaseConfig from '../../firebase-applet-config.json';
 
 /** Connection request stored in Firestore */
 export interface ConnectionRequest {
@@ -51,16 +54,34 @@ export interface ConnectionRequest {
   taskId?: string;
 }
 
-// Active Firebase project configuration (defaults to creates-b8e17 from firebase-applet-config.json)
+// Firebase config — ONLY from environment variables (.env local / Render env).
+// Do not import firebase-applet-config.json.
 export const firebaseConfig = {
-  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID || rawFirebaseConfig.projectId || 'creates-b8e17',
-  appId: import.meta.env.VITE_FIREBASE_APP_ID || rawFirebaseConfig.appId,
-  apiKey: import.meta.env.VITE_FIREBASE_API_KEY || rawFirebaseConfig.apiKey,
-  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN || rawFirebaseConfig.authDomain || 'creates-b8e17.firebaseapp.com',
-  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET || rawFirebaseConfig.storageBucket || 'creates-b8e17.firebasestorage.app',
-  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID || rawFirebaseConfig.messagingSenderId,
-  measurementId: import.meta.env.VITE_FIREBASE_MEASUREMENT_ID || rawFirebaseConfig.measurementId,
+  apiKey: import.meta.env.VITE_FIREBASE_API_KEY as string,
+  authDomain: import.meta.env.VITE_FIREBASE_AUTH_DOMAIN as string,
+  projectId: import.meta.env.VITE_FIREBASE_PROJECT_ID as string,
+  storageBucket: import.meta.env.VITE_FIREBASE_STORAGE_BUCKET as string,
+  messagingSenderId: import.meta.env.VITE_FIREBASE_MESSAGING_SENDER_ID as string,
+  appId: import.meta.env.VITE_FIREBASE_APP_ID as string,
+  measurementId: (import.meta.env.VITE_FIREBASE_MEASUREMENT_ID as string) || undefined,
 };
+
+if (typeof window !== 'undefined') {
+  const required = {
+    VITE_FIREBASE_API_KEY: firebaseConfig.apiKey,
+    VITE_FIREBASE_AUTH_DOMAIN: firebaseConfig.authDomain,
+    VITE_FIREBASE_PROJECT_ID: firebaseConfig.projectId,
+    VITE_FIREBASE_APP_ID: firebaseConfig.appId,
+  };
+  const missing = Object.entries(required).filter(([, v]) => !v).map(([k]) => k);
+  if (missing.length) {
+    console.error(
+      '[Firebase] Missing environment variables:',
+      missing.join(', '),
+      '— add them to .env (local) or Render Environment Variables, then restart (local) or clear build cache & redeploy (Render).'
+    );
+  }
+}
 
 // Initialize Firebase App singleton
 const app = getApps().length > 0 ? getApp() : initializeApp(firebaseConfig);
@@ -136,11 +157,48 @@ export async function sendEmailViaGmailApi(
   }
 }
 
-// Initialize Firestore (with custom databaseId if configured)
-const customDbId = (firebaseConfig as Record<string, any>).firestoreDatabaseId;
-export const db = customDbId
-  ? getFirestore(app, customDbId)
-  : getFirestore(app);
+// Initialize Firestore
+// experimentalForceLongPolling helps avoid false "client is offline" on some localhost / proxy networks
+const customDbId = (import.meta.env.VITE_FIRESTORE_DATABASE_ID as string) || undefined;
+function createFirestore() {
+  try {
+    // Prefer initializeFirestore so we can pass settings (only works once per app)
+    if (customDbId) {
+      return initializeFirestore(app, customDbId as any);
+    }
+    return initializeFirestore(app, {
+      experimentalForceLongPolling: true,
+    } as any);
+  } catch {
+    // Already initialized (HMR) — reuse existing instance
+    return customDbId ? getFirestore(app, customDbId) : getFirestore(app);
+  }
+}
+export const db = createFirestore();
+
+/** Ensure we try the network before reads/writes (clears sticky offline state) */
+async function ensureFirestoreOnline(): Promise<void> {
+  try {
+    await enableNetwork(db);
+  } catch {
+    // ignore — may already be online
+  }
+}
+
+/** getDoc that prefers server; clearer errors when Firestore is unreachable */
+async function getDocOnline(ref: ReturnType<typeof doc>) {
+  await ensureFirestoreOnline();
+  try {
+    return await getDocFromServer(ref);
+  } catch (err: any) {
+    const msg = String(err?.message || err || '');
+    // Fall back to cache/default getDoc if server path fails for non-offline reasons
+    if (!msg.includes('offline') && err?.code !== 'unavailable') {
+      return await getDoc(ref);
+    }
+    throw err;
+  }
+}
 
 /**
  * Sign in with Google Popup (requests profile, email, and gmail.send scopes)
@@ -302,7 +360,8 @@ export async function syncUserProfileToFirestore(
 
   try {
     const userRef = doc(db, 'users', fbUser.uid);
-    const docSnap = await getDoc(userRef);
+    await ensureFirestoreOnline();
+    const docSnap = await getDocOnline(userRef);
 
     if (docSnap.exists()) {
       // Existing profile is source of truth — never re-apply empty/demo defaults over saved fields
@@ -343,13 +402,20 @@ export async function syncUserProfileToFirestore(
 export async function getProfileFromFirestore(userId: string): Promise<CreatorProfile | null> {
   try {
     const userRef = doc(db, 'users', userId);
-    const snap = await getDoc(userRef);
+    const snap = await getDocOnline(userRef);
     if (snap.exists()) {
       return { id: userId, ...(snap.data() as CreatorProfile) };
     }
     return null;
   } catch (err: any) {
-    console.warn('[Firestore] Profile fetch failed:', err?.message || err);
+    const msg = String(err?.message || err || '');
+    console.warn(
+      '[Firestore] Profile fetch failed:',
+      msg,
+      msg.includes('offline')
+        ? '→ Check: 1) Firestore is enabled in Firebase Console 2) Project ID / API key match 3) Network allows firestore.googleapis.com'
+        : ''
+    );
     return null;
   }
 }
@@ -361,16 +427,25 @@ export async function updateProfileInFirestore(profile: CreatorProfile): Promise
   if (!profile?.id) {
     throw new Error('Profile id is required to save.');
   }
+  await ensureFirestoreOnline();
   const userRef = doc(db, 'users', profile.id);
-  // Full write of the profile document (merge) — await so save failures surface to UI
   const payload = {
     ...profile,
     id: profile.id,
     updatedAt: serverTimestamp(),
   };
-  await setDoc(userRef, payload, { merge: true });
-  // Re-read to confirm persistence
-  const snap = await getDoc(userRef);
+  try {
+    await setDoc(userRef, payload, { merge: true });
+  } catch (err: any) {
+    const msg = String(err?.message || err || '');
+    if (msg.includes('offline') || err?.code === 'unavailable') {
+      throw new Error(
+        'Firestore is offline. Enable Cloud Firestore in Firebase Console for this project, check your internet, and confirm VITE_FIREBASE_* / firebase config match project creates-b8e17.'
+      );
+    }
+    throw err;
+  }
+  const snap = await getDocOnline(userRef);
   if (snap.exists()) {
     return { id: profile.id, ...(snap.data() as CreatorProfile) };
   }
